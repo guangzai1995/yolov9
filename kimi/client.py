@@ -58,7 +58,7 @@ def save_audio_from_base64(base64_data, output_path):
 # 使用示例
 if __name__ == "__main__":
     # 示例1: 语音转录
-    asr_result = transcribe_audio("path/to/your/audio.wav")
+    asr_result = transcribe_audio("test_audios/asr_example.wav")
     print("Transcription Result:", asr_result["text"])
     
     # 示例2: 纯文本对话
@@ -73,7 +73,7 @@ if __name__ == "__main__":
     # 示例3: 带音频输入的对话 (输出音频)
     audio_chat_result = audio_chat(
         messages=[
-            {"role": "user", "message_type": "audio", "content": "path/to/question.wav"}
+            {"role": "user", "message_type": "audio", "content": "test_audios/qa_example.wav"}
         ],
         output_type="audio"
     )
@@ -84,7 +84,7 @@ if __name__ == "__main__":
     mixed_result = audio_chat(
         messages=[
             {"role": "user", "message_type": "text", "content": "请听以下音频并回答"},
-            {"role": "user", "message_type": "audio", "content": "path/to/question.wav"}
+            {"role": "user", "message_type": "audio", "content": "qa_example.wav"}
         ],
         output_type="both"
     )

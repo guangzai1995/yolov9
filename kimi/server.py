@@ -12,19 +12,17 @@ app = Flask(__name__)
 
 # 全局模型实例
 model = None
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def initialize_model():
     global model
-    model_id = "/work/model/moonshotai/Kimi-Audio-7B-Instruct/"
+    model_id = "/bmcp_lvm_fs/cusa/models/kimi-Audio-7B-Instruct/"
     try:
         model = KimiAudio(model_path=model_id, load_detokenizer=True)
-        model.to(device)
-        print("Model loaded successfully on device:", device)
+        print("Model loaded successfully on device:")
     except Exception as e:
         print(f"Model loading failed: {e}")
         raise RuntimeError("Model initialization failed")
-
+initialize_model()
 # 默认采样参数
 DEFAULT_SAMPLING_PARAMS = {
     "audio_temperature": 0.8,
@@ -37,9 +35,6 @@ DEFAULT_SAMPLING_PARAMS = {
     "text_repetition_window_size": 16,
 }
 
-@app.before_first_request
-def before_first_request():
-    initialize_model()
 
 def save_audio_file(audio_data, filename):
     """保存上传的音频文件并返回路径"""
