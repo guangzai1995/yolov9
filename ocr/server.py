@@ -1,101 +1,154 @@
-import asyncio
-import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import base64
+import io
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from paddleocr import PaddleOCR
 import numpy as np
-import cv2
-import base64
-import logging
+from PIL import Image
+import uvicorn
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("PaddleOCR-Server")
+app = FastAPI(title="OCR服务", description="基于PaddleOCR的文字识别服务")
 
-app = FastAPI()
-ocr = PaddleOCR(lang='ch')
+# 全局OCR实例
+ocr = None
+executor = ThreadPoolExecutor(max_workers=4)
 
-# 全局模型加载
-logger.info("PaddleOCR模型加载完成，服务已就绪")
-
-class ImageRequest(BaseModel):
+class OCRRequest(BaseModel):
     image_base64: str
-    need_preprocess: bool = False
+    lang: str = "ch"
 
-@app.post("/ocr")
-async def process_image(request: ImageRequest):
+class OCRResponse(BaseModel):
+    success: bool
+    message: str
+    results: list = []
+
+class HealthResponse(BaseModel):
+    status: str
+    message: str
+
+@app.on_event("startup")
+async def startup_event():
+    """应用启动时初始化OCR模型"""
+    global ocr
     try:
-        # 解码Base64图像
-        logger.info("开始处理OCR请求")
-        image_data = base64.b64decode(request.image_base64)
-        nparr = np.frombuffer(image_data, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        # 可选图像预处理
-        if request.need_preprocess:
-            logger.info("执行图像预处理")
-            img = preprocess_image(img)
-        
-        # 使用线程池执行OCR
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, ocr.ocr, img)
-        
-        # 调试：记录原始结果结构
-        logger.debug(f"OCR原始结果类型: {type(result)}")
-        if result:
-            logger.debug(f"第一个元素类型: {type(result[0])}")
-            if result[0]:
-                logger.debug(f"第一行类型: {type(result[0][0])}")
-                logger.debug(f"第一行内容: {result[0][0]}")
-        
-        # 格式化结果 - 修复解包问题
-        formatted = []
-        for page in result:  # 处理多页结果
-            for line in page:
-                # 检查结果结构 - 可能是 [box, (text, confidence)] 或 [box, text, confidence]
-                if len(line) == 2:
-                    # 标准结构: [坐标, (文本, 置信度)]
-                    box, text_conf = line
-                    text, confidence = text_conf
-                elif len(line) >= 3:
-                    # 备用结构: [坐标, 文本, 置信度]
-                    box, text, confidence = line[:3]
-                else:
-                    logger.warning(f"无法识别的行结构: {line}")
-                    continue
-                
-                # 确保box是可序列化的
-                if hasattr(box, 'tolist'):
-                    box = box.tolist()
-                
-                formatted.append({
-                    "coordinates": box,
-                    "text": text,
-                    "confidence": float(confidence)
-                })
-        
-        logger.info(f"成功处理OCR请求，识别到 {len(formatted)} 个文本区域")
-        return {"success": True, "results": formatted}
-    
+        ocr = PaddleOCR(lang='ch')
+        print("OCR模型加载成功")
     except Exception as e:
-        logger.error(f"处理OCR请求时出错: {str(e)}")
-        return {"success": False, "error": str(e)}
+        print(f"OCR模型加载失败: {e}")
 
-def preprocess_image(img):
-    """图像预处理增强"""
-    # 转换为灰度图
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # 自适应阈值二值化
-    thresh = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY, 11, 2
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """健康检查接口"""
+    if ocr is None:
+        return HealthResponse(
+            status="unhealthy",
+            message="OCR模型未加载"
+        )
+    return HealthResponse(
+        status="healthy",
+        message="服务运行正常"
     )
+
+def decode_base64_image(base64_str: str) -> np.ndarray:
+    """解码base64图片为numpy数组"""
+    try:
+        # 移除base64前缀（如果有的话）
+        if base64_str.startswith('data:image'):
+            base64_str = base64_str.split(',')[1]
+        
+        # 解码base64
+        image_data = base64.b64decode(base64_str)
+        
+        # 转换为PIL图片
+        image = Image.open(io.BytesIO(image_data))
+        
+        # 转换为RGB格式（如果需要）
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # 转换为numpy数组
+        image_array = np.array(image)
+        
+        return image_array
+    except Exception as e:
+        raise ValueError(f"图片解码失败: {e}")
+
+def run_ocr(image_array: np.ndarray) -> list:
+    """在线程池中运行OCR识别"""
+    try:
+        result = ocr.predict(image_array)
+        print(f"OCR原始结果: {result}")  # 调试日志
+        return result
+    except Exception as e:
+        raise RuntimeError(f"OCR识别失败: {e}")
+
+@app.post("/ocr", response_model=OCRResponse)
+async def ocr_predict(request: OCRRequest):
+    """OCR文字识别接口"""
+    if ocr is None:
+        raise HTTPException(status_code=503, detail="OCR服务未初始化")
     
-    # 可选: 去噪
-    denoised = cv2.fastNlMeansDenoising(thresh, h=10)
-    
-    return denoised
+    try:
+        # 解码base64图片
+        image_array = decode_base64_image(request.image_base64)
+        
+        # 异步运行OCR识别
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(executor, run_ocr, image_array)
+        
+        # 处理识别结果
+        formatted_results = []
+        
+        # PaddleOCR结果格式检查和处理
+        if result is not None and len(result) > 0:
+            # result是一个列表，通常只有一个元素（对应一张图片）
+            page_result = result[0] if result[0] is not None else []
+            
+            for line_info in page_result:
+                try:
+                    if line_info and len(line_info) >= 2:
+                        # line_info格式: [bbox, (text, confidence)]
+                        bbox = line_info[0] if line_info[0] else []
+                        text_info = line_info[1] if line_info[1] else ("", 0.0)
+                        
+                        # 处理文本信息
+                        if isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
+                            text = str(text_info[0]) if text_info[0] else ""
+                            confidence = float(text_info[1]) if text_info[1] else 0.0
+                        else:
+                            text = str(text_info) if text_info else ""
+                            confidence = 0.0
+                        
+                        formatted_results.append({
+                            "text": text,
+                            "confidence": confidence,
+                            "bbox": bbox
+                        })
+                        
+                except Exception as e:
+                    print(f"处理单行结果时出错: {e}, line_info: {line_info}")
+                    continue
+        
+        return OCRResponse(
+            success=True,
+            message=f"识别成功，共识别到{len(formatted_results)}行文字",
+            results=formatted_results
+        )
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        print(f"服务器内部错误详情: {e}")  # 调试日志
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {e}")
+
+@app.get("/")
+async def root():
+    """根路径"""
+    return {"message": "OCR服务运行中", "docs": "/docs"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
