@@ -1,0 +1,82 @@
+0. 准备模型文件、服务测试脚本、测试音频文件
+所有文件放到  /bmcp_lvm_fs/cusa/models/sensevoicesmall 目录下
+> ls /bmcp_lvm_fs/cusa/models/sensevoicesmall
+> logs SenseVoiceSmall speech_fsmn_vad_zh-cn-16k-common-pytorch test
+
+1. 查看环境中可用的基础镜像
+> nerdctl images |grep vllm0.8.5
+> reg.docker.alibaba-inc.com/aisw/llm           v1.5.2-pytorch2.6.0-ubuntu24.04-cuda12.6-vllm0.8.5-py312                     bff449d79c31    4 days ago    linux/amd64    35.5 GiB     35.0 GiB
+
+2. 创建容器环境
+> time nerdctl run -td --name xinference_sense_voice_small --privileged --network=host --ipc=host --ulimit memlock=-1 --ulimit stack=6708864 --shm-size=128g --device=/dev/alixpu $(for dev in /dev/alixpu_ppu[0-9]*; do echo "--device $dev";done) --device=/dev/alixpu_ctl -v /bmcp_lvm_fs:/bmcp_lvm_fs  bff449d79c31
+
+3. 进入容器
+> nerdctl exec -it xinference_sense_voice_small bash
+
+4.安装xinference依赖
+> pip install xinference  -i  https://mirrors.aliyun.com/pypi/simple
+> pip install funasr -i  https://mirrors.aliyun.com/pypi/simple
+
+5. 命令行测试语音模型部署
+> nohup xinference-local --host 0.0.0.0 --port 40001 > logs/SenseVoiceSmall_xinference-local.log 2>&1 &
+> xinference launch --model-type audio --model-name SenseVoiceSmall --model_path /bmcp_lvm_fs/cusa/models/sensevoicesmall/SenseVoiceSmall/ --vad_model  /bmcp_lvm_fs/cusa/models/sensevoicesmall/speech_fsmn_vad_zh-cn-16k-common-pytorch --endpoint http://localhost:40001
+
+6. 命令行使用python测试脚本验证模型部署情况
+> cd /bmcp_lvm_fs/cusa/models/sensevoicesmall/test/ 
+> python asr_test.py
+出现音频识别结果则表示模型服务正常。如：
+"""
+转录结果：
+xxxxxxxxxxxxxx音频识别输出xxxxxxxxxxxxxxxxxxxxx
+"""
+
+7.创建shell启动脚本，将启动命令封装到shell脚本中
+脚本要求：
+1）xinference-local  启动命令去掉nohup
+2）脚本最后需加上 "tail -f /etc/hosts/"  否则脚本中的服务启动命令会反复重启执行
+
+修改后脚本为：start_xinference_sense_vocie_small.sh 
+
+
+8. 启动脚本确认无误后打包镜像
+>nerdctl commit xinference_sense_voice_small custom-ppu-llm-v1.5.2-pytorch2.6.0-ubuntu24.04-cuda12.6-vlim0.8.5-py312-sense_voice_small:v1.0
+>nerdctl save -o ppu-llm-v1.5.2-pytorch2.6.0-ubuntu24.04-cuda12.6-vllm0.8.5-py312-sense_voice_small.tar  custom-ppu-llm-v1.5.2-pytorch2.6.0-ubuntu24.04-cuda12.6-vllm0.8.5-py312-sense_voice_small:v1.0
+
+9. 部署在线服务（测试）
+（先随机指定一个在线服务启动命令，完成首次在线服务容器创建）
+
+在线服务创建完成后，回到命令行查找对应容器：
+> nerdctl ps -l 
+
+以上命令查找到容器后，利用容器id获取容器日志：
+> nerdctl logs 容器id
+
+查找容器路径映射关系
+> nerdctl inspect 容器id
+得出容器路径映射关系为：  /bmcp_lvm_fs/cusa/models/sensevoicesmall ---> /models/SenseVoicesmall/
+
+
+10. 部署在线服务（正式部署）
+
+根据 "第9步" 得出的容器路径映射关系修改在线服务启动命令为：
+bash -x /workspace/pytorch/start_xinference_sense_vocie_small.sh --port 30005 --logname/models/sensevoicesmall/logs/xinference_sense_voice_small.log --model path /models/SenseVoicesmall/sensevoicesmall --sleep time 30  --vad_model /models/senseVoicesmall/speech_fsmn_vad_zh-cn-16k-common-pytorch
+
+使用修改后命令进行服务部署
+
+部署在线服务时部署镜像选择：custom-ppu-llm-v1.5.2-pytorch2.6.0-ubuntu24.04-cuda12.6-vllm0.8.5-py312-sense_voice_small:v1.0
+
+11. 在线服务部署结果验证
+
+在线服务创建完成后，回到命令行查找对应容器：
+> nerdctl ps -l 
+
+以上命令查找到容器后，进入容器进行测试
+> nerdctl exec -it 容器id bash 
+> cd /models/test/
+> python asr_test.py
+
+出现音频识别结果则表示模型服务正常。如：
+"""
+转录结果：
+xxxxxxxxxxxxxx音频识别输出xxxxxxxxxxxxxxxxxxxxx
+"""
