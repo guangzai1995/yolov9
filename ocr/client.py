@@ -1,103 +1,86 @@
-import argparse
+import asyncio
+import aiohttp
+import sys
 import base64
 import json
-import logging
+import time
 import os
-import requests
-from typing import Dict, Any, List
 
-# 配置日志记录
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
-
-class OCRClient:
-    """OCR服务客户端"""
+async def send_image(image_path, need_preprocess=False):
+    # 检查文件是否存在
+    if not os.path.exists(image_path):
+        print(f"错误: 文件 '{image_path}' 不存在")
+        return {"success": False, "error": "文件不存在"}
     
-    def __init__(self, api_url: str):
-        """初始化OCR客户端"""
-        self.api_url = api_url
-        
-    def process_file(self, file_path: str, output_dir: str = ".") -> None:
-        """处理单个文件并保存OCR结果"""
-        try:
-            # 检查文件是否存在
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"文件不存在: {file_path}")
-                
-            # 读取并编码文件
-            with open(file_path, "rb") as file:
-                file_bytes = file.read()
-                file_data = base64.b64encode(file_bytes).decode("ascii")
-                
-            # 准备请求
-            payload = {"file": file_data, "fileType": 1}
-            
-            # 发送请求
-            logger.info(f"正在发送请求到 {self.api_url}")
-            response = requests.post(self.api_url, json=payload)
-            
-            # 检查响应状态
-            response.raise_for_status()
-            
-            # 处理响应
-            result = response.json()
-            
-            # 验证响应结构
-            if "result" not in result or "ocrResults" not in result["result"]:
-                raise ValueError("无效的响应格式")
-                
-            # 创建输出目录（如果不存在）
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # 处理OCR结果
-            ocr_results = result["result"]["ocrResults"]
-            logger.info(f"成功获取 {len(ocr_results)} 个OCR结果")
-            
-            for i, res in enumerate(ocr_results):
-                # 提取文本结果
-                text_result = res.get("prunedResult", "")
-                print(f"结果 {i+1}: {text_result}")
-                
-                # 保存OCR图像（如果存在）
-                ocr_image_data = res.get("ocrImage")
-                if ocr_image_data:
-                    ocr_img_path = os.path.join(output_dir, f"ocr_{i}.jpg")
-                    with open(ocr_img_path, "wb") as f:
-                        f.write(base64.b64decode(ocr_image_data))
-                    logger.info(f"图像已保存至 {ocr_img_path}")
-                    
-        except Exception as e:
-            logger.error(f"处理文件时出错: {str(e)}")
-            raise
+    # 读取并编码图像
+    try:
+        with open(image_path, 'rb') as f:
+            image_data = f.read()
+            image_base64 = base64.b64encode(image_data).decode('utf-8')
+    except Exception as e:
+        print(f"读取文件出错: {str(e)}")
+        return {"success": False, "error": str(e)}
+    
+    # 准备请求数据
+    payload = {
+        "image_base64": image_base64,
+        "need_preprocess": need_preprocess
+    }
+    
+    # 发送请求
+    start_time = time.time()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                'http://localhost:8000/ocr',
+                json=payload,
+                headers={'Content-Type': 'application/json'},
+                timeout=60  # 60秒超时
+            ) as response:
+                result = await response.json()
+                elapsed = time.time() - start_time
+                result['processing_time'] = f"{elapsed:.2f}秒"
+                return result
+    except Exception as e:
+        print(f"请求服务器出错: {str(e)}")
+        return {"success": False, "error": str(e)}
+
+def print_result(result):
+    if not result.get('success'):
+        print(f"OCR失败: {result.get('error', '未知错误')}")
+        return
+    
+    print("\nOCR结果:")
+    for idx, item in enumerate(result['results'], 1):
+        print(f"{idx}. 文本: {item['text']}")
+        print(f"   置信度: {item['confidence']:.4f}")
+        print(f"   坐标: {item['coordinates']}")
+    
+    # 统计信息
+    total_items = len(result['results'])
+    total_chars = sum(len(item['text']) for item in result['results'])
+    avg_confidence = sum(item['confidence'] for item in result['results']) / total_items if total_items > 0 else 0
+    
+    print("\n统计:")
+    print(f" - 识别区域数: {total_items}")
+    print(f" - 总字符数: {total_chars}")
+    print(f" - 平均置信度: {avg_confidence:.4f}")
+    print(f" - 处理时间: {result.get('processing_time', '未知')}")
 
 def main():
-    """主函数"""
-    # 创建命令行参数解析器
-    parser = argparse.ArgumentParser(description="OCR服务客户端")
-    parser.add_argument("--api-url", default="http://localhost:8206/ocr", help="OCR API的URL")
-    parser.add_argument("--input-file", required=True, help="要处理的文件路径")
-    parser.add_argument("--output-dir", default=".", help="输出结果的目录")
-    parser.add_argument("--verbose", action="store_true", help="启用详细日志")
     
-    # 解析命令行参数
-    args = parser.parse_args()
+    image_path = "test.jpg"
+    need_preprocess = False
     
-    # 设置日志级别
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
+    print(f"处理图像: {image_path}")
+    if need_preprocess:
+        print("启用图像预处理")
     
     try:
-        # 创建OCR客户端并处理文件
-        client = OCRClient(args.api_url)
-        client.process_file(args.input_file, args.output_dir)
-        
+        result = asyncio.run(send_image(image_path, need_preprocess))
+        print_result(result)
     except Exception as e:
-        logger.error(f"程序执行失败: {str(e)}")
-        exit(1)
+        print(f"客户端运行时错误: {str(e)}")
 
 if __name__ == "__main__":
-    main()    
+    main()
