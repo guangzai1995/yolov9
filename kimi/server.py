@@ -1,29 +1,21 @@
-# server.py
 import os
-import time
-import uuid
+import tempfile
 import base64
+import uvicorn
 import soundfile as sf
 import torch
-from flask import Flask, request, jsonify
-from kimia_infer.api.kimia import KimiAudio
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse,PlainTextResponse
+from pydantic import BaseModel
+from typing import List, Dict, Optional
+from kimia_infer.api.kimia import KimiAudio  # 确保已安装
 
-app = Flask(__name__)
+app = FastAPI(title="Kimi-Audio API Service")
 
 # 全局模型实例
 model = None
+model_loaded = False
 
-def initialize_model():
-    global model
-    model_id = "/bmcp_lvm_fs/cusa/models/kimi-Audio-7B-Instruct/"
-    try:
-        model = KimiAudio(model_path=model_id, load_detokenizer=True)
-        print("Model loaded successfully on device:")
-    except Exception as e:
-        print(f"Model loading failed: {e}")
-        raise RuntimeError("Model initialization failed")
-initialize_model()
-# 默认采样参数
 DEFAULT_SAMPLING_PARAMS = {
     "audio_temperature": 0.8,
     "audio_top_k": 10,
@@ -36,133 +28,124 @@ DEFAULT_SAMPLING_PARAMS = {
 }
 
 
-def save_audio_file(audio_data, filename):
-    """保存上传的音频文件并返回路径"""
-    upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, filename)
-    
+class AudioContent(BaseModel):
+    data: str  # base64编码的音频数据
+    filename: str  # 原始文件名（可选）
+    sample_rate: int = 24000  # 采样率
+
+class Message(BaseModel):
+    role: str
+    message_type: str
+    content: str  # 文本内容或Base64编码的音频数据
+
+class InferenceRequest(BaseModel):
+    messages: List[Message]
+    output_type: str = "both"
+    sampling_params: Optional[Dict] = None
+
+def load_model():
+    """启动时加载模型"""
+    global model,model_loaded
     try:
-        # 尝试解码base64
-        if isinstance(audio_data, str) and audio_data.startswith("data:"):
-            header, data = audio_data.split(",", 1)
-            audio_bytes = base64.b64decode(data)
-            with open(file_path, "wb") as f:
-                f.write(audio_bytes)
-        else:
-            # 直接保存二进制数据
-            with open(file_path, "wb") as f:
-                f.write(audio_data)
-        return file_path
+        model_id = "/work/moonshotai/Kimi-Audio-7B-Instruct/"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        model = KimiAudio(model_path=model_id, load_detokenizer=True)
+        #model.to(device)
+        model_loaded = True
+        print(f"Model loaded successfully on {device}")
     except Exception as e:
-        print(f"Error saving audio: {e}")
-        return None
+        raise RuntimeError(f"Model loading failed: {str(e)}")
+load_model()
 
-@app.route('/v1/audio/transcriptions', methods=['POST'])
-def transcribe_audio():
-    """语音转录端点 (符合OpenAI格式)"""
-    start_time = time.time()
-    
-    if 'file' not in request.files:
-        return jsonify({"error": "No audio file provided"}), 400
-    
-    audio_file = request.files['file']
-    filename = f"transcribe_{uuid.uuid4()}.wav"
-    audio_path = save_audio_file(audio_file.read(), filename)
-    
-    if not audio_path:
-        return jsonify({"error": "Failed to process audio file"}), 500
-
+def save_base64_audio(base64_data: str) -> str:
+    """将Base64音频数据保存为临时文件"""
     try:
-        # 构建消息
-        messages = [
-            {"role": "user", "message_type": "text", "content": "请转录以下音频内容："},
-            {"role": "user", "message_type": "audio", "content": audio_path}
-        ]
+        # 解码Base64数据
+        audio_bytes = base64.b64decode(base64_data)
         
-        # 获取请求参数或使用默认值
-        params = request.form.to_dict()
-        sampling_params = {**DEFAULT_SAMPLING_PARAMS, **params}
+        # 创建临时文件
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(audio_bytes)
+            return tmp.name
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid audio data: {str(e)}")
+
+def has_audio_message(messages: List[Message]) -> bool:
+    """检查消息列表中是否包含语音消息"""
+    for msg in messages:
+        if msg.message_type == "audio":
+            return True
+    return False
+
+
+@app.get("/health")
+async def health_check():
+    """健康检查端点"""
+    if model_loaded and model is not None:
+        return PlainTextResponse("OK", status_code=200)
+    else:
+        return PlainTextResponse("Model not loaded", status_code=503)
+
+
+@app.post("/infer")
+async def kimi_inference(request: InferenceRequest):
+    """处理推理请求"""
+    if model is None or not model_loaded:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    if not has_audio_message(request.messages):
+        raise HTTPException(
+            status_code=400,
+            detail="Request must contain at least one audio message"
+        )
+
+    # 处理临时文件
+    temp_files = []
+    processed_messages = []
+    
+    try:
+        # 处理消息中的音频数据
+        for msg in request.messages:
+            if msg.message_type == "audio":
+                # 音频消息 - 保存为临时文件
+                file_path = save_base64_audio(msg.content)
+                temp_files.append(file_path)
+                processed_messages.append({
+                    "role": msg.role,
+                    "message_type": "audio",
+                    "content": file_path
+                })
+            else:
+                # 文本消息 - 直接使用
+                processed_messages.append(msg.dict())
         
-        # 执行转录
-        _, text_output = model.generate(messages, **sampling_params, output_type="text")
+        params = {**DEFAULT_SAMPLING_PARAMS, **(request.sampling_params or {})} 
         
-        # 清理临时文件
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
+        # 执行推理
+        if request.output_type == "text":
+            _, text_output = model.generate(processed_messages, **params, output_type="text")
+            audio_b64 = None
+        else:
+            wav_output, text_output = model.generate(processed_messages, **params, output_type="both")
+            
+            # 将生成的音频保存为Base64
+            with tempfile.NamedTemporaryFile(suffix=".wav") as tmp_audio:
+                sf.write(tmp_audio.name, wav_output.detach().cpu().view(-1).numpy(), 24000)
+                with open(tmp_audio.name, "rb") as f:
+                    audio_b64 = base64.b64encode(f.read()).decode("utf-8")
         
-        # 构建OpenAI格式响应
-        return jsonify({
+        return JSONResponse({
             "text": text_output,
-            "processing_time": round(time.time() - start_time, 2)
+            "audio": audio_b64 if request.output_type != "text" else None,
+            "sample_rate": 24000
         })
     
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    finally:
+        # 清理临时文件
+        for f in temp_files:
+            if os.path.exists(f):
+                os.unlink(f)
 
-@app.route('/v1/audio/chat/completions', methods=['POST'])
-def audio_chat():
-    """音频聊天端点 (自定义扩展格式)"""
-    start_time = time.time()
-    data = request.json
-    
-    if not data or "messages" not in data:
-        return jsonify({"error": "Invalid request format"}), 400
-    
-    # 处理消息中的音频
-    processed_messages = []
-    for msg in data["messages"]:
-        if msg.get("message_type") == "audio" and "content" in msg:
-            filename = f"chat_{uuid.uuid4()}.wav"
-            audio_path = save_audio_file(msg["content"], filename)
-            if audio_path:
-                msg["content"] = audio_path
-        processed_messages.append(msg)
-    
-    # 获取输出类型和参数
-    output_type = data.get("output_type", "text")
-    params = data.get("parameters", {})
-    sampling_params = {**DEFAULT_SAMPLING_PARAMS, **params}
-    
-    try:
-        # 执行生成
-        if output_type == "text":
-            _, text_output = model.generate(processed_messages, **sampling_params, output_type="text")
-            audio_output = None
-        elif output_type == "audio":
-            wav_output, _ = model.generate(processed_messages, **sampling_params, output_type="audio")
-            audio_output = wav_output.detach().cpu().view(-1).numpy()
-            text_output = None
-        else:  # both
-            wav_output, text_output = model.generate(processed_messages, **sampling_params, output_type="both")
-            audio_output = wav_output.detach().cpu().view(-1).numpy()
-        
-        # 处理音频输出
-        audio_data = None
-        if audio_output is not None:
-            output_path = f"output_{uuid.uuid4()}.wav"
-            sf.write(output_path, audio_output, 24000)
-            with open(output_path, "rb") as f:
-                audio_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(output_path)
-        
-        # 清理输入音频文件
-        for msg in processed_messages:
-            if isinstance(msg.get("content"), str) and msg.get("message_type") == "audio":
-                if os.path.exists(msg["content"]):
-                    os.remove(msg["content"])
-        
-        # 构建响应
-        response = {
-            "text": text_output,
-            "audio": audio_data,
-            "output_type": output_type,
-            "processing_time": round(time.time() - start_time, 2)
-        }
-        return jsonify(response)
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=5000)
