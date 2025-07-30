@@ -1,123 +1,83 @@
-import asyncio
-import aiohttp
 import base64
+import requests
+import argparse
 import json
-from pathlib import Path
-from typing import Optional
+import time
+import os
 
-class OCRClient:
-    def __init__(self, base_url: str = "http://localhost:8000"):
-        self.base_url = base_url
-        self.session: Optional[aiohttp.ClientSession] = None
-    
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
-    
-    def image_to_base64(self, image_path: str) -> str:
-        """将图片文件转换为base64编码"""
-        try:
-            with open(image_path, "rb") as image_file:
-                encoded = base64.b64encode(image_file.read()).decode('utf-8')
-                return encoded
-        except Exception as e:
-            raise ValueError(f"图片编码失败: {e}")
-    
-    async def check_health(self) -> dict:
-        """检查服务健康状态"""
-        if not self.session:
-            raise RuntimeError("客户端未初始化")
-        
-        try:
-            async with self.session.get(f"{self.base_url}/health") as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    return {
-                        "status": "error",
-                        "message": f"HTTP {response.status}: {await response.text()}"
-                    }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"连接失败: {e}"
-            }
-    
-    async def ocr_predict(self, image_path: str, lang: str = "ch") -> dict:
-        """执行OCR识别"""
-        if not self.session:
-            raise RuntimeError("客户端未初始化")
-        
-        try:
-            # 检查文件大小
-            file_size = Path(image_path).stat().st_size
-            print(f"图片文件大小: {file_size / 1024:.2f} KB")
-            
-            # 转换图片为base64
-            image_base64 = self.image_to_base64(image_path)
-            print(f"Base64编码长度: {len(image_base64)}")
-            
-            # 准备请求数据
-            data = {
-                "image_base64": image_base64,
-                "lang": lang
-            }
-            
-            # 发送请求
-            async with self.session.post(
-                f"{self.base_url}/ocr",
-                json=data,
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=60)  # 增加超时时间
-            ) as response:
-                
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    error_text = await response.text()
-                    print(f"服务器错误响应: {error_text}")  # 调试信息
-                    return {
-                        "success": False,
-                        "message": f"HTTP {response.status}: {error_text}",
-                        "results": []
-                    }
-                    
-        except Exception as e:
-            print(f"客户端请求异常: {e}")  # 调试信息
-            return {
-                "success": False,
-                "message": f"请求失败: {e}",
-                "results": []
-            }
+def image_to_base64(image_path: str) -> str:
+    """将图像转换为base64字符串"""
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode("utf-8")
 
-# 使用示例
-async def main():
-    async with OCRClient() as client:
-        # 检查服务状态
-        print("检查服务健康状态...")
-        health = await client.check_health()
-        print(f"健康状态: {health}")
-        
-        if health.get("status") != "healthy":
-            print("服务不可用，退出")
+def test_health(server_url: str):
+    """测试健康检查端点"""
+    try:
+        response = requests.get(f"{server_url}/health")
+        print(f"Health check status: {response.status_code}")
+        print(f"Response: {json.dumps(response.json(), indent=2)}")
+        return response.status_code == 200
+    except Exception as e:
+        print(f"Health check failed: {str(e)}")
+        return False
+
+def test_ocr(server_url: str, image_path: str):
+    """测试OCR端点"""
+    try:
+        # 检查文件是否存在
+        if not os.path.exists(image_path):
+            print(f"Error: File not found: {image_path}")
             return
-        
-        # 执行OCR识别
-        image_path = "test.jpg"  # 请确保图片存在
-        if Path(image_path).exists():
-            print(f"\n开始识别图片: {image_path}")
-            result = await client.ocr_predict(image_path)
             
-            if result["success"]:
-                print(f"识别成功！识别结果: {result['results']}")
-            else:
-                print(f"识别失败: {result['message']}")
+        # 转换图像为base64
+        base64_data = image_to_base64(image_path)
+        
+        # 发送请求
+        start_time = time.time()
+        response = requests.post(
+            f"{server_url}/ocr",
+            json={"image_base64": base64_data}
+        )
+        processing_time = time.time() - start_time
+        
+        # 处理响应
+        if response.status_code == 200:
+            result = response.json()
+            print(f"OCR processed in {processing_time:.2f} seconds")
+            print(f"Status: {result['status']}")
+            
+            # 打印识别结果
+            for i, page in enumerate(result["result"]):
+                print(f"\nPage {i+1}:")
+                
+                # 检查结果结构
+                if "rec_texts" in page and page["rec_texts"]:
+                    for j, (text, score) in enumerate(zip(page["rec_texts"], page["rec_scores"])):
+                        print(f"  Text {j+1}: {text} (confidence: {score:.4f})")
+                elif "rec_res" in page and page["rec_res"]:
+                    for j, (text, score) in enumerate(page["rec_res"]):
+                        print(f"  Text {j+1}: {text} (confidence: {score:.4f})")
+                else:
+                    print("  No text recognized")
+                    
+            # 保存完整结果
+            with open("ocr_result.json", "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+            print("\nFull result saved to ocr_result.json")
         else:
-            print(f"图片文件不存在: {image_path}")
+            print(f"Error: {response.status_code}")
+            print(f"Response: {response.text}")
+    
+    except Exception as e:
+        print(f"OCR request failed: {str(e)}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="PaddleOCR API Client")
+    parser.add_argument("--server", default="http://localhost:8000", help="Server URL")
+    parser.add_argument("--image", required=True, help="Path to image file")
+    args = parser.parse_args()
+    
+    # 先检查服务健康状态
+    if test_health(args.server):
+        print("\nService is healthy, sending OCR request...")
+        test_ocr(args.server, args.image)
