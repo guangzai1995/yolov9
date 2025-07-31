@@ -47,18 +47,16 @@ def test_ocr(server_url: str, image_path: str):
             print(f"Status: {result['status']}")
             
             # 打印识别结果
-            for i, page in enumerate(result["result"]):
-                print(f"\nPage {i+1}:")
-                
-                # 检查结果结构
-                if "rec_texts" in page and page["rec_texts"]:
-                    for j, (text, score) in enumerate(zip(page["rec_texts"], page["rec_scores"])):
-                        print(f"  Text {j+1}: {text} (confidence: {score:.4f})")
-                elif "rec_res" in page and page["rec_res"]:
-                    for j, (text, score) in enumerate(page["rec_res"]):
-                        print(f"  Text {j+1}: {text} (confidence: {score:.4f})")
-                else:
-                    print("  No text recognized")
+            if "result" in result and isinstance(result["result"], list):
+                for i, item in enumerate(result["result"]):
+                    if "rec_texts" in item and item["rec_texts"]:
+                        text = item["rec_texts"][0]
+                        score = item["rec_scores"][0] if "rec_scores" in item and item["rec_scores"] else 0
+                        print(f"Text {i+1}: {text} (confidence: {score:.4f})")
+                    else:
+                        print(f"Text {i+1}: No text recognized")
+            else:
+                print("No text recognized in the image")
                     
             # 保存完整结果
             with open("ocr_result.json", "w", encoding="utf-8") as f:

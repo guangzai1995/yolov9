@@ -1,12 +1,10 @@
 import base64
 import asyncio
 import numpy as np
-from io import BytesIO
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from paddleocr import PaddleOCR
-from PIL import Image
 import uvicorn
 import logging
 import cv2
@@ -34,7 +32,7 @@ def init_ocr():
     try:
         logger.info("Running a quick test inference...")
         test_img = np.zeros((100, 100, 3), dtype=np.uint8)
-        result = ocr.predict(input=test_img)
+        result = ocr.ocr(test_img)
         logger.info(f"Test inference result type: {type(result)}")
         logger.info(f"Test inference result structure: {result}")
         logger.info("Test inference completed successfully")
@@ -79,70 +77,51 @@ def process_ocr_result(ocr_result):
     """处理OCR结果，转换为可序列化的格式"""
     processed = []
     
-    # 检查结果结构 - 可能是列表或字典
-    if isinstance(ocr_result, list) and len(ocr_result) > 0:
-        # 新版本PaddleOCR返回列表，每个元素是一个字典
-        for res in ocr_result:
-            # 获取识别文本和置信度
-            rec_texts = res.get('rec_texts', [])
-            rec_scores = res.get('rec_scores', [])
-            
-            # 如果rec_texts为空，尝试从其他字段获取
-            if not rec_texts:
-                rec_res = res.get('rec_res', [])
-                if rec_res:
-                    rec_texts = [item[0] for item in rec_res]
-                    rec_scores = [float(item[1]) for item in rec_res]
-            
-            # 获取检测框
-            dt_boxes = res.get('dt_boxes', [])
-            dt_polys = res.get('dt_polys', [])
-            
-            # 如果dt_boxes为空，尝试从其他字段获取
-            if not dt_boxes and 'boxes' in res:
-                dt_boxes = res['boxes']
-            
-            # 转换结果格式
-            res_dict = {
-                "rec_texts": rec_texts,
-                "rec_scores": rec_scores,
-                "dt_boxes": [box.tolist() if hasattr(box, 'tolist') else box for box in dt_boxes],
-                "dt_polys": [poly.tolist() if hasattr(poly, 'tolist') else poly for poly in dt_polys],
-            }
-            
-            # 添加其他可能存在的字段
-            for key in ['input_path', 'page_index', 'textline_orientation_angles']:
-                if key in res:
-                    value = res[key]
-                    if hasattr(value, 'tolist'):
-                        value = value.tolist()
-                    res_dict[key] = value
-            
-            processed.append(res_dict)
+    # 根据提供的结果，OCR返回的是多层嵌套列表
+    # 先展平结果结构
+    flattened = []
     
-    else:
-        # 旧版本PaddleOCR可能返回对象
-        logger.warning("Unexpected OCR result format. Attempting to process as object.")
+    # 递归展平列表
+    def flatten_list(lst):
+        for item in lst:
+            if isinstance(item, list) and len(item) > 0:
+                # 检查是否是我们要找的文本区域结构 [框坐标, (文本, 置信度)]
+                if isinstance(item[0], list) and isinstance(item[1], tuple) and len(item[1]) == 2:
+                    flattened.append(item)
+                else:
+                    flatten_list(item)
+    
+    flatten_list(ocr_result)
+    
+    # 处理展平后的结果
+    for item in flattened:
         try:
-            # 尝试使用旧版属性访问
-            res_dict = {
-                "rec_texts": ocr_result.rec_texts,
-                "rec_scores": [float(score) for score in ocr_result.rec_scores],
-                "dt_boxes": [box.tolist() for box in ocr_result.dt_boxes],
-                "dt_polys": [poly.tolist() for poly in ocr_result.dt_polys],
-            }
+            dt_box = item[0]  # 检测框坐标
+            rec_text, rec_score = item[1]  # 文本和置信度
             
-            # 添加其他可能存在的字段
-            if hasattr(ocr_result, 'textline_orientation_angles'):
-                res_dict["textline_orientation_angles"] = ocr_result.textline_orientation_angles.tolist()
+            # 确保检测框是列表格式
+            if hasattr(dt_box, 'tolist'):
+                dt_box_list = dt_box.tolist()
+            elif isinstance(dt_box, (list, tuple)):
+                dt_box_list = [list(coord) if isinstance(coord, (list, tuple, np.ndarray)) else coord 
+                              for coord in dt_box]
+            else:
+                dt_box_list = [dt_box]
             
-            if hasattr(ocr_result, 'input_path'):
-                res_dict["input_path"] = ocr_result.input_path
+            # 确保置信度是浮点数
+            try:
+                rec_score = float(rec_score)
+            except (ValueError, TypeError):
+                rec_score = 0.0
                 
+            res_dict = {
+                "rec_texts": [rec_text],
+                "rec_scores": [rec_score],
+                "dt_boxes": dt_box_list
+            }
             processed.append(res_dict)
         except Exception as e:
-            logger.error(f"Failed to process OCR result: {str(e)}")
-            logger.error(f"Result structure: {ocr_result}")
+            logger.warning(f"Error processing OCR item: {item}, error: {e}")
     
     return processed
 
@@ -166,13 +145,14 @@ async def ocr_endpoint(image_data: dict):
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None, 
-            lambda: ocr.predict(input=cv_image)
+            lambda: ocr.ocr(cv_image)
         )
         
         # 记录原始结果用于调试
         logger.info(f"Raw OCR result type: {type(result)}")
         if isinstance(result, list) and result:
             logger.info(f"First result element type: {type(result[0])}")
+            logger.info(f"First result element content: {result[0]}")
         
         # 处理并返回结果
         processed_result = process_ocr_result(result)
@@ -183,4 +163,11 @@ async def ocr_endpoint(image_data: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description="Run PaddleOCR API server")
+    parser.add_argument("--port", type=int, default=8000, help="Port to run the server on (default: 8000)")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the server on (default: 0.0.0.0)")
+    args = parser.parse_args()
+    
+    # 使用解析的参数启动服务
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
